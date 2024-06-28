@@ -1,0 +1,446 @@
+---
+title: "Local Moran's I with p-value adjustment"
+date: "`r Sys.Date()`"
+author: "Sven Lautenbach"
+output:
+  rmdformats::readthedown:
+      rmdformats::readthedown:
+      self_contained: true
+      thumbnails: true
+      lightbox: true
+      gallery: false
+      highlight: tango
+---
+
+```{r setup}
+library(spdep)
+library(sf)
+library(geojsonsf)
+library(tmap)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(lwgeom)
+```
+
+# Preprocessing
+
+
+```{r}
+are <- geojson_sf("../data/are_mean_median_kontur_corpo_non_corpo_combi_withMeta.geojson")
+
+idn <- geojson_sf("../data/idn_mean_median_kontur_corpo_non_corpo_combi_withMeta_v2.geojson")
+col <- geojson_sf("../data/col_mean_median_kontur_corpo_non_corpo_combi_with_meta_v2.geojson")
+
+st_crs(are) <- 3857
+are <- are |> filter(!is.na(fid))
+
+st_crs(idn) <- 3857
+idn <- idn |> filter(!is.na(fid))
+
+st_crs(col) <- 3857
+col <- col |> filter(!is.na(fid))
+
+```
+
+```{r}
+tm_shape(are) + tm_polygons(col="diff_non_corpo")
+```
+
+
+```{r}
+library(rgeoboundaries) # to install, execute: remotes::install_github("wmgeolab/rgeoboundaries")
+countries <- gb_adm0() # download all countries
+countries <- st_transform(countries, crs= st_crs(are))
+
+#countries$shapeName
+are_poly <- countries |> filter(shapeName=="United Arab Emirates")
+idn_poly <- countries |> filter(shapeName=="Indonesia")
+col_poly <- countries |> filter(shapeName=="Colombia")
+```
+
+# NB definition
+
+Take care of islands!
+
+
+```{r}
+are_nbQueen <- poly2nb(are, queen= TRUE)
+idn_nbQueen <- poly2nb(idn, queen= TRUE)
+col_nbQueen <- poly2nb(col, queen= TRUE)
+
+p1 <- as.data.frame(table(card(are_nbQueen))) %>%
+  ggplot(aes(x=Var1, y=Freq)) +
+  geom_col() + xlab("Number of neighbors") +
+  labs(title="United Arab Emirates")
+p2 <- as.data.frame(table(card(idn_nbQueen))) %>%
+  ggplot(aes(x=Var1, y=Freq)) +
+  geom_col() + xlab("Number of neighbors") +
+  labs(title="Indonesia")
+p3 <- as.data.frame(table(card(col_nbQueen))) %>%
+  ggplot(aes(x=Var1, y=Freq)) +
+  geom_col() + xlab("Number of neighbors") +
+  labs(title="Colombia")
+
+ggarrange(p1, p2, p3)
+```
+
+Row standardization
+
+```{r}
+are_lwQueen <- nb2listw(are_nbQueen, style= "W", zero.policy = TRUE)
+idn_lwQueen <- nb2listw(idn_nbQueen, style= "W", zero.policy = TRUE)
+col_lwQueen <- nb2listw(col_nbQueen, style= "W", zero.policy = TRUE)
+```
+
+```{r}
+plot(st_geometry(are), border = "grey60", reset = FALSE)
+plot(are_lwQueen, coords=st_coordinates(st_centroid(are)), col="red",  cex=.7, add=TRUE)
+```
+
+# Local Moran's I
+
+```{r function local Morans I }
+getLocalMoranFactor <- function(x, listw, pval, quadr = "mean", p.adjust.method ="holm", method="normal", nb)
+{
+  if(! (quadr %in% c("mean", "median", "pysal")))
+    stop("getLocalMoranFactor: quadr needs to be one of the following values: 'mean', 'median', 'pysal'")
+  if(! (method %in% c("normal", "perm")))
+    stop("getLocalMoranFactor: method needs to be one of the following values: 'normal', 'perm'")
+  if(! (p.adjust.method %in% p.adjust.methods))
+    stop(paste("getLocalMoranFactor: p.adjust.method needs to be one of the following values:", p.adjust.methods))
+  
+  # adjust for multiple testing
+  if(method == "normal")
+    lMc <- spdep::localmoran(x, listw= listw) 
+  else
+    lMc <- spdep::localmoran_perm(x, listw= listw)
+  lMc[,5] <-  p.adjustSP(lMc[,5], method = p.adjust.method, nb = nb)
+  lMcQuadr <- attr(lMc, "quadr")
+  
+  lMcFac <- as.character(lMcQuadr[, quadr])
+  # which values are significant
+  idx <- which(lMc[,5]> pval)
+  lMcFac[idx] <- "Not sign."
+  lMcFac <- factor(lMcFac, levels = c("Not sign.", "Low-Low", "Low-High", "High-Low",  "High-High"))
+  
+  # set those with empty neighbors to NA
+  
+  idx <- which(card(nb)==0)
+  lMcFac[idx] <- "Not sign."
+  
+  return(list(lMcFac, lMc[,5]))
+}
+```
+
+## UAE
+
+### diff_non_corpo
+
+```{r}
+are_lisa <- getLocalMoranFactor(x= are$diff_non_corpo,
+                    listw= are_lwQueen,
+                    nb= are_nbQueen,
+                    pval=.05)
+# local Moran's I quadrants
+are$localM_non_corpo <- are_lisa[[1]]
+xtabs(~localM_non_corpo, data=are)
+# adjusted p-values
+are$localM_adjPval_non_corpo <- are_lisa[[2]]
+ggplot(are |> filter(localM_adjPval_non_corpo < 0.1), aes(x=localM_adjPval_non_corpo)) +
+  geom_histogram(binwidth=0.005) + xlab("Adjusted p-values") +
+  labs(title="Histogram for UAE, diff non corpo", subtitle="Only adjusted p-values < 0.1")
+```
+
+```{r}
+localMcPalette <- c("white", "midnightblue", "lightblue", "lightpink", "red")
+
+#tmap_mode("view")
+
+m_are_non_corpo <- tm_shape(are_poly) + tm_polygons(col="lightgrey") +
+  tm_shape(countries) + tm_polygons(col="darkgrey") +
+  tm_shape(are) + 
+  tm_polygons(col="localM_non_corpo", palette= localMcPalette, 
+              legend.hist = FALSE, legend.reverse = TRUE, title = "LISA") +
+  tm_layout(legend.outside = FALSE, bg.color = "steelblue", outer.bg.color = "lightgrey",
+            legend.outside.size = 0.5, attr.outside = TRUE, legend.bg.color = "white",
+            legend.outside.position = "right", main.title = "UAE, diff non corpo",
+            outer.margins= c(0,0.02,0,0.02), asp=0) + tm_scale_bar()
+```
+
+### Diff corpo
+
+```{r}
+are_lisa_corpo <- getLocalMoranFactor(x= are$diff_corpo,
+                    listw= are_lwQueen,
+                    nb= are_nbQueen,
+                    pval=.05)
+# local Moran's I quadrants
+are$localM_corpo <- are_lisa_corpo[[1]]
+xtabs(~localM_corpo, data=are)
+# adjusted p-values
+are$localM_adjPval_corpo <- are_lisa_corpo[[2]]
+ggplot(are |> filter(localM_adjPval_corpo < 0.1), aes(x=localM_adjPval_corpo)) +
+  geom_histogram(binwidth=0.005) + xlab("Adjusted p-values") +
+  labs(title="Histogram for UAE, diff corpo", subtitle="Only adjusted p-values < 0.1")
+```
+
+```{r}
+#tmap_mode("view")
+
+m_are_corpo <- tm_shape(are_poly) + tm_polygons(col="lightgrey") +
+  tm_shape(countries) + tm_polygons(col="grey") + tm_shape(are) + 
+  tm_polygons(col="localM_corpo", palette= localMcPalette, 
+              legend.hist = FALSE, legend.reverse = TRUE, title = "LISA") +
+  tm_layout(legend.outside = FALSE, bg.color = "steelblue", outer.bg.color = "lightgrey",
+            legend.outside.size = 0.5, attr.outside = TRUE, legend.bg.color = "white",
+            legend.outside.position = "right", main.title = "UAE, diff corpo",
+            outer.margins= c(0,0.02,0,0.02), asp=0) + tm_scale_bar()
+```
+
+```{r, fig.height=5, fig.width=10}
+tmap_arrange(m_are_non_corpo, m_are_corpo)
+```
+
+
+## Indonesia
+
+### Diff non corpo
+
+```{r}
+idn_lisa <- getLocalMoranFactor(x= idn$diff_non_corpo,
+                    listw= idn_lwQueen,
+                    nb= idn_nbQueen,
+                    pval=.05)
+# local Moran's I quadrants
+idn$localM_non_corpo <- idn_lisa[[1]]
+xtabs(~localM_non_corpo, data=idn)
+# adjusted p-values
+idn$localM_adjPval_non_corpo <- idn_lisa[[2]]
+
+ggplot(idn |> filter(localM_adjPval_non_corpo < 0.1), aes(x=localM_adjPval_non_corpo)) +
+  geom_histogram(binwidth=0.005) + xlab("Adjusted p-values") +
+  labs("Histogram for Indonesia", subtitle="Only adjusted p-values < 0.1")
+```
+
+```{r, fig.height=7, fig.width=11}
+m_idn_non_corpo <- tm_shape(idn_poly) + tm_polygons(col="lightgrey") +
+  tm_shape(countries) + tm_polygons(col="darkgrey") + 
+  tm_shape(idn) + 
+  tm_fill(col="localM_non_corpo", palette= localMcPalette, 
+              legend.hist = FALSE, legend.reverse = TRUE, title = "LISA",
+              border.alpha=.5) +
+  tm_layout(legend.outside = FALSE, bg.color = "steelblue", outer.bg.color = "lightgrey",
+            legend.outside.size = 0.5, attr.outside = TRUE, legend.bg.color = "white",
+            legend.position =c("right", "top"),
+            legend.outside.position = "right", main.title = "Indonesia, diff non corpo",
+            outer.margins= c(0,0.02,0,0.02), asp=0) + tm_scale_bar()
+```
+
+### Diff corpo
+
+```{r}
+idn_lisa_corpo <- getLocalMoranFactor(x= idn$diff_corpo,
+                    listw= idn_lwQueen,
+                    nb= idn_nbQueen,
+                    pval=.05)
+# local Moran's I quadrants
+idn$localM_corpo <- idn_lisa_corpo[[1]]
+xtabs(~localM_corpo, data=idn)
+# adjusted p-values
+idn$localM_adjPval_corpo <- idn_lisa_corpo[[2]]
+ggplot(idn |> filter(localM_adjPval_corpo < 0.1), aes(x=localM_adjPval_corpo)) +
+  geom_histogram(binwidth=0.005) + xlab("Adjusted p-values") +
+  labs(title="Histogram for Indonesia, diff corpo", subtitle="Only adjusted p-values < 0.1")
+```
+
+```{r, fig.height=7, fig.width=11}
+#tmap_mode("view")
+
+m_idn_corpo <- tm_shape(idn_poly) + tm_polygons(col="lightgrey") +
+  tm_shape(countries) + tm_polygons(col="darkgrey") + 
+  tm_shape(idn) + 
+  tm_fill(col="localM_corpo", palette= localMcPalette, 
+              legend.hist = FALSE, legend.reverse = TRUE, title = "LISA") +
+  tm_layout(legend.outside = FALSE, bg.color = "steelblue", outer.bg.color = "lightgrey",
+            legend.outside.size = 0.5, attr.outside = TRUE, legend.bg.color = "white",
+            legend.position =c("right", "top"),
+            legend.outside.position = "right", main.title = "Indonesia, diff corpo",
+            outer.margins= c(0,0.02,0,0.02), asp=0) + tm_scale_bar()
+```
+
+```{r, fig.width=11, fig.height=10}
+tmap_arrange(m_idn_non_corpo, m_idn_corpo, nrow = 2)
+```
+
+
+## Colombia
+
+## Diff non corpo
+
+```{r}
+col_lisa <- getLocalMoranFactor(x= col$diff_non_corpo,
+                    listw= col_lwQueen,
+                    nb= col_nbQueen,
+                    pval=.05)
+# local Moran's I quadrants
+col$localM_non_corpo <- col_lisa[[1]]
+xtabs(~localM_non_corpo, data=col)
+# adjusted p-values
+col$localM_adjPval_non_corpo <- col_lisa[[2]]
+
+ggplot(col |> filter(localM_adjPval_non_corpo < 0.1), aes(x=localM_adjPval_non_corpo)) +
+  geom_histogram(binwidth=0.005) + xlab("Adjusted p-values") +
+  labs("Histogram for Colombia", subtitle="Only adjusted p-values < 0.1")
+```
+
+```{r, fig.height=7, fig.width=6}
+m_col_non_corpo <- tm_shape(col_poly) + tm_polygons(col="lightgrey") +
+  tm_shape(countries) + tm_polygons(col="darkgrey") +
+  tm_shape(col) + 
+  tm_fill(col="localM_non_corpo", palette= localMcPalette, 
+              legend.hist = FALSE, legend.reverse = TRUE, title = "LISA") +
+  tm_layout(legend.outside = FALSE, bg.color = "steelblue", outer.bg.color = "lightgrey",
+            legend.outside.size = 0.5, attr.outside = TRUE, legend.bg.color = "white",
+            legend.outside.position = "right", main.title = "Colombia, diff non corpo",
+            outer.margins= c(0,0.02,0,0.02), asp=0) + tm_scale_bar()
+```
+
+
+### Diff corpo
+
+```{r}
+col_lisa_corpo <- getLocalMoranFactor(x= col$diff_corpo,
+                    listw= col_lwQueen,
+                    nb= col_nbQueen,
+                    pval=.05)
+# local Moran's I quadrants
+col$localM_corpo <- col_lisa_corpo[[1]]
+xtabs(~localM_corpo, data=col)
+# adjusted p-values
+col$localM_adjPval_corpo <- col_lisa_corpo[[2]]
+ggplot(col |> filter(localM_adjPval_corpo < 0.1), aes(x=localM_adjPval_corpo)) +
+  geom_histogram(binwidth=0.005) + xlab("Adjusted p-values") +
+  labs(title="Histogram for Colombia, diff corpo", subtitle="Only adjusted p-values < 0.1")
+```
+
+```{r, fig.height=7, fig.width=6}
+#tmap_mode("view")
+
+m_col_corpo <- tm_shape(col_poly) + tm_polygons(col="lightgrey") +
+  tm_shape(countries) + tm_polygons(col="darkgrey") +
+  tm_shape(col) + 
+  tm_fill(col="localM_corpo", palette= localMcPalette, 
+              legend.hist = FALSE, legend.reverse = TRUE, title = "LISA") +
+  tm_layout(legend.outside = FALSE, bg.color = "steelblue", outer.bg.color = "lightgrey",
+            legend.outside.size = 0.5, attr.outside = TRUE, legend.bg.color = "white",
+            legend.outside.position = "right", main.title = "Colombia, diff corpo",
+            outer.margins= c(0,0.02,0,0.02), asp=0) + tm_scale_bar()
+```
+
+```{r, fig.height=7, fig.width=10}
+tmap_arrange(m_col_non_corpo, m_col_corpo )
+```
+
+# Confusion tables for clusters between corporate and non corporate mapping activities
+
+## UAE
+
+Absolute number of hexagon cells
+
+```{r}
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=are)
+```
+
+Percentage
+
+```{r}
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=are) |>
+  prop.table() |>
+  round(4) * 100
+```
+
+Raw differences for corporate and non corporate mappers per hexagon cell
+
+```{r}
+ggplot(are, aes(x=diff_corpo, y= diff_non_corpo)) +
+  geom_point(alpha=.2) +
+  xlab("Difference in corporate mapping activity") +
+  ylab("Difference in non-corporate mapping activity") +
+  labs(title="UAE")
+```
+
+## Indonesia
+
+```{r}
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=idn)
+```
+
+The rows represent the local Moran's I categories for difference of the non corporate mappers while the columns represent the same for the corporate mappers.
+
+To double check:
+
+```{r}
+xtabs(~ localM_non_corpo, data=idn)
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=idn) |> rowSums()
+```
+
+
+```{r}
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=idn)|>
+  prop.table() |>
+  round(4)*100
+```
+
+Raw differences for corporate and non corporate mappers per hexagon cell
+
+```{r}
+ggplot(idn, aes(x=diff_corpo, y= diff_non_corpo)) +
+  geom_point(alpha=.2) +
+  xlab("Difference in corporate mapping activity") +
+  ylab("Difference in non-corporate mapping activity") +
+  labs(title="Indonesia")
+```
+
+
+
+## Colombia
+
+```{r}
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=col)
+```
+
+
+```{r}
+xtabs(~ localM_non_corpo + localM_corpo, 
+      data=col)|>
+  prop.table() |>
+  round(4)*100
+```
+
+Raw differences for corporate and non corporate mappers per hexagon cell
+
+```{r}
+ggplot(col, aes(x=diff_corpo, y= diff_non_corpo)) +
+  geom_point(alpha=.2) +
+  xlab("Difference in corporate mapping activity") +
+  ylab("Difference in non-corporate mapping activity") +
+  labs(title="Columbia")
+```
+
+# Write results to geopackage
+
+Currently not evaluated to avoid unnecessary storage at gitlab.
+
+```{r, eval=FALSE}
+st_write(dplyr::select(are, !fid), dsn="lisa_diff_non_corpo_corpo.gpkg", layer="are", append=FALSE)
+st_write(dplyr::select(idn, !fid), dsn="lisa_diff_non_corpo_corpo.gpkg", layer="idn", append=FALSE)
+st_write(dplyr::select(col, !fid), dsn="lisa_diff_non_corpo_corpo.gpkg", layer="col", append=FALSE)
+```
+
